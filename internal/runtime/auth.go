@@ -1,42 +1,40 @@
-// internal/runtime/auth.go
 package runtime
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 
 	"github.com/mbrt/gmailctl/cmd/gmailctl/localcred"
-	"google.golang.org/api/gmail/v1"
-
-	gc "github.com/yourorg/chronosweep/internal/gmail"
 )
 
+// Scope controls which Gmail OAuth scope is requested from gmailctl's local credentials store.
 type Scope int
 
 const (
+	// ScopeReadonly grants access only to read message metadata.
 	ScopeReadonly Scope = iota
+	// ScopeModify grants access to modify labels and mark messages read.
 	ScopeModify
 )
 
-func NewGmailClient(ctx context.Context, cfgDir string, scope Scope) (gc.Client, error) {
-	var svc *gmail.Service
-	var err error
-	// localcred chooses scopes based on what the binary requests on first run
+// NewGmailClient constructs a gmail.Client backed by the Google API Go client using gmailctl's credential store.
+func NewGmailClient(ctx context.Context, cfgDir string, scope Scope) (*ClientAdapter, error) {
 	switch scope {
-	case ScopeReadonly:
-		svc, err = (localcred.Provider{}).ServiceWithScopes(ctx, cfgDir, gmail.GmailReadonlyScope)
-	case ScopeModify:
-		svc, err = (localcred.Provider{}).ServiceWithScopes(ctx, cfgDir, gmail.GmailModifyScope)
+	case ScopeReadonly, ScopeModify:
 	default:
-		panic("unknown scope")
+		return nil, fmt.Errorf("unsupported scope %d", scope)
 	}
+	provider := localcred.Provider{}
+	svc, err := provider.Service(ctx, cfgDir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create gmail service: %w", err)
 	}
 	return NewGoogleAPIClient(svc), nil
 }
 
+// DefaultLogger returns a slog.Logger configured for structured CLI output.
 func DefaultLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 }

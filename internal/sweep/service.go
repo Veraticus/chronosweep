@@ -1,107 +1,285 @@
-// internal/sweep/service.go
 package sweep
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
-	gc "github.com/yourorg/chronosweep/internal/gmail"
+	"github.com/joshsymonds/chronosweep/internal/gmail"
 )
 
+// Limiter is the minimal rate limiter interface the service needs.
+type Limiter interface {
+	Wait(ctx context.Context) error
+}
+
+const (
+	maxPageSize         = 500
+	batchSize           = 1000
+	splitPairSeparator  = 2
+	defaultExpiredLabel = "auto-archived/expired"
+)
+
+// Spec configures a single sweep pass.
 type Spec struct {
-	Label  string        // optional: restrict sweep to this label
-	Grace  time.Duration // how long to wait before sweeping
-	DryRun bool
+	Label          string
+	Grace          time.Duration
+	DryRun         bool
+	PauseWeekends  bool
+	GraceOverrides map[string]time.Duration
+	ExcludeLabels  []string
+	ExpiredLabel   string
+	PageSize       int
 }
 
+// Service sweeps stale messages out of the inbox while labeling them for safety.
 type Service struct {
-	Client       gc.Client
-	Log          *slog.Logger
-	Rate         interface{ Wait(context.Context) error } // small interface
-	ExpiredLabel string
-	Exclude      []string
-	PageSize     int
+	Client  gmail.Client
+	Limiter Limiter
+	Logger  *slog.Logger
+	Clock   func() time.Time
 }
 
-func ParseGraceMap(s string) map[string]time.Duration {
-	out := map[string]time.Duration{}
-	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		kv := strings.SplitN(part, "=", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		if d, err := time.ParseDuration(strings.TrimSpace(kv[1])); err == nil {
-			out[strings.TrimSpace(kv[0])] = d
-		}
+// NewService constructs a sweeper with injected dependencies.
+func NewService(client gmail.Client, limiter Limiter, logger *slog.Logger) *Service {
+	return &Service{
+		Client:  client,
+		Limiter: limiter,
+		Logger:  logger,
+		Clock:   time.Now,
 	}
-	return out
 }
 
+// Run executes the sweep according to spec.
 func (s *Service) Run(ctx context.Context, spec Spec) error {
-	th := time.Now().Add(-spec.Grace).Unix()
-	parts := []string{"in:inbox", "is:unread", fmt.Sprintf("before:%d", th), "-is:starred", "-is:important"}
-	for _, l := range s.Exclude {
-		parts = append(parts, fmt.Sprintf(`-label:"%s"`, l))
-	}
-	if spec.Label != "" {
-		parts = append([]string{fmt.Sprintf(`label:"%s"`, spec.Label)}, parts...)
-	}
-	q := gc.Query{Raw: strings.Join(parts, " ")}
-
-	var all []gc.MessageID
-	pageToken := ""
-	for {
-		if err := s.Rate.Wait(ctx); err != nil {
-			return err
-		}
-		ids, next, err := s.Client.List(ctx, q, s.PageSize)
-		if err != nil {
-			return err
-		}
-		all = append(all, ids...)
-		if next == "" {
-			break
-		}
-		pageToken = next // for completeness; List can close over next token
-		_ = pageToken
-	}
-	if len(all) == 0 {
-		s.Log.Info("no messages to sweep", "label", spec.Label, "grace", spec.Grace)
-		return nil
-	}
-	if spec.DryRun {
-		s.Log.Info("dry-run", "label", spec.Label, "grace", spec.Grace, "count", len(all))
-		return nil
-	}
-	lid, err := s.Client.EnsureLabel(ctx, s.ExpiredLabel)
-	if err != nil {
+	if err := validateSpec(spec); err != nil {
 		return err
 	}
 
-	ops := gc.ModifyOps{
-		AddLabels:    []gc.LabelID{lid},
-		RemoveLabels: []gc.LabelID{"UNREAD", "INBOX"},
-		MarkRead:     true, // explicit for clarity
-		Archive:      true,
+	logger := s.Logger
+	if spec.DryRun {
+		logger.InfoContext(
+			ctx,
+			"sweep dry-run configured",
+			slog.String("label", spec.Label),
+			slog.Duration("grace", spec.Grace),
+		)
 	}
-	// Chunk conservatively (Gmail API allows 1000/message batch modify)
-	const chunk = 1000
-	for i := 0; i < len(all); i += chunk {
-		j := i + chunk
-		if j > len(all) {
-			j = len(all)
+
+	if spec.PauseWeekends && s.shouldPauseForWeekend() {
+		logger.InfoContext(
+			ctx,
+			"weekend pause enabled; skipping sweep",
+			slog.String("label", spec.Label),
+		)
+		return nil
+	}
+
+	grace := s.effectiveGrace(spec)
+	pageSize := normalizePageSize(spec.PageSize)
+	query := gmail.Query{
+		Raw: strings.Join(
+			buildQueryParts(spec.Label, spec.ExcludeLabels, s.Clock().Add(-grace).Unix()),
+			" ",
+		),
+	}
+
+	ids, err := s.collectMessageIDs(ctx, query, pageSize)
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		logger.InfoContext(
+			ctx,
+			"no stale messages",
+			slog.String("label", spec.Label),
+			slog.Int("count", 0),
+		)
+		return nil
+	}
+
+	if spec.DryRun {
+		logger.InfoContext(
+			ctx,
+			"dry-run sweep",
+			slog.String("label", spec.Label),
+			slog.Int("count", len(ids)),
+			slog.Duration("grace", grace),
+		)
+		return nil
+	}
+
+	expiredLabel := spec.ExpiredLabel
+	if expiredLabel == "" {
+		expiredLabel = defaultExpiredLabel
+	}
+	labelID, err := s.Client.EnsureLabel(ctx, expiredLabel)
+	if err != nil {
+		return fmt.Errorf("ensure expired label %q: %w", expiredLabel, err)
+	}
+
+	ops := gmail.ModifyOps{
+		AddLabels: []gmail.LabelID{labelID},
+		MarkRead:  true,
+		Archive:   true,
+	}
+	if applyErr := s.applyBatches(ctx, ids, ops); applyErr != nil {
+		return applyErr
+	}
+
+	logger.InfoContext(
+		ctx,
+		"sweep complete",
+		slog.String("label", spec.Label),
+		slog.Int("count", len(ids)),
+		slog.Duration("grace", grace),
+	)
+	return nil
+}
+
+func (s *Service) collectMessageIDs(
+	ctx context.Context,
+	query gmail.Query,
+	pageSize int,
+) ([]gmail.MessageID, error) {
+	var (
+		ids   []gmail.MessageID
+		token string
+		page  int
+	)
+	for {
+		page++
+		if err := s.wait(ctx, "rate limit list messages"); err != nil {
+			return nil, err
 		}
-		if err := s.Client.BatchModify(ctx, all[i:j], ops); err != nil {
+		resp, err := s.Client.List(ctx, query, token, pageSize)
+		if err != nil {
+			return nil, fmt.Errorf("list page %d: %w", page, err)
+		}
+		ids = append(ids, resp.IDs...)
+		if resp.NextPageToken == "" {
+			break
+		}
+		token = resp.NextPageToken
+	}
+	return ids, nil
+}
+
+func (s *Service) applyBatches(
+	ctx context.Context,
+	ids []gmail.MessageID,
+	ops gmail.ModifyOps,
+) error {
+	for start := 0; start < len(ids); start += batchSize {
+		end := start + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		if err := s.wait(ctx, "rate limit batch modify"); err != nil {
 			return err
 		}
+		if err := s.Client.BatchModify(ctx, ids[start:end], ops); err != nil {
+			return fmt.Errorf("batch modify %d-%d: %w", start, end, err)
+		}
 	}
-	s.Log.Info("swept", "label", spec.Label, "grace", spec.Grace, "count", len(all))
 	return nil
+}
+
+// ParseGraceMap converts CLI input into per-label durations.
+func ParseGraceMap(input string) (map[string]time.Duration, error) {
+	if strings.TrimSpace(input) == "" {
+		return map[string]time.Duration{}, nil
+	}
+	items := strings.Split(input, ",")
+	result := make(map[string]time.Duration, len(items))
+	saw := map[string]struct{}{}
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		parts := strings.SplitN(item, "=", splitPairSeparator)
+		if len(parts) != splitPairSeparator {
+			return nil, fmt.Errorf("invalid grace map entry %q", item)
+		}
+		label := strings.TrimSpace(parts[0])
+		dur, err := time.ParseDuration(strings.TrimSpace(parts[1]))
+		if err != nil {
+			return nil, fmt.Errorf("parse duration for %q: %w", label, err)
+		}
+		if dur <= 0 {
+			return nil, fmt.Errorf("duration for %q must be positive", label)
+		}
+		if _, exists := saw[label]; exists {
+			return nil, fmt.Errorf("duplicate grace map entry for %q", label)
+		}
+		saw[label] = struct{}{}
+		result[label] = dur
+	}
+	return result, nil
+}
+
+func buildQueryParts(label string, exclude []string, before int64) []string {
+	parts := []string{
+		"in:inbox",
+		"is:unread",
+		fmt.Sprintf("before:%d", before),
+		"-is:starred",
+		"-is:important",
+	}
+	if label != "" {
+		parts = append([]string{fmt.Sprintf(`label:"%s"`, label)}, parts...)
+	}
+	sorted := append([]string(nil), exclude...)
+	sort.Strings(sorted)
+	for _, ex := range sorted {
+		ex = strings.TrimSpace(ex)
+		if ex == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf(`-label:"%s"`, ex))
+	}
+	return parts
+}
+
+func (s *Service) wait(ctx context.Context, operation string) error {
+	if s.Limiter == nil {
+		return nil
+	}
+	if err := s.Limiter.Wait(ctx); err != nil {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	return nil
+}
+
+func (s *Service) shouldPauseForWeekend() bool {
+	weekday := s.Clock().In(time.Local).Weekday()
+	return weekday == time.Saturday || weekday == time.Sunday
+}
+
+func (s *Service) effectiveGrace(spec Spec) time.Duration {
+	if spec.Label == "" || spec.GraceOverrides == nil {
+		return spec.Grace
+	}
+	if override, ok := spec.GraceOverrides[spec.Label]; ok && override > 0 {
+		return override
+	}
+	return spec.Grace
+}
+
+func validateSpec(spec Spec) error {
+	if spec.Grace <= 0 {
+		return fmt.Errorf("grace must be positive")
+	}
+	return nil
+}
+
+func normalizePageSize(size int) int {
+	if size <= 0 || size > maxPageSize {
+		return maxPageSize
+	}
+	return size
 }

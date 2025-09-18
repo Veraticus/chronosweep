@@ -1,46 +1,63 @@
-// internal/rate/limiter.go
 package rate
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
+// Limiter gates outbound API calls so we respect Gmail rate limits.
 type Limiter interface {
 	Wait(ctx context.Context) error
 }
 
+// TokenBucket implements a simple fixed-rate token bucket limiter.
 type TokenBucket struct {
-	ticker *time.Ticker
-	ch     chan struct{}
+	ticker   *time.Ticker
+	tokens   chan struct{}
+	stopDone chan struct{}
 }
 
+// NewTokenBucket returns a limiter that releases rps tokens per second.
 func NewTokenBucket(rps int) *TokenBucket {
-	tb := &TokenBucket{
-		ticker: time.NewTicker(time.Second / time.Duration(max(1, rps))),
-		ch:     make(chan struct{}, rps),
+	if rps <= 0 {
+		rps = 1
 	}
-	go func() {
-		for range tb.ticker.C {
-			select {
-			case tb.ch <- struct{}{}:
-			default:
-			}
-		}
-	}()
+	tb := &TokenBucket{
+		ticker:   time.NewTicker(time.Second / time.Duration(rps)),
+		tokens:   make(chan struct{}, rps),
+		stopDone: make(chan struct{}),
+	}
+	// allow the first call to proceed immediately
+	tb.tokens <- struct{}{}
+	go tb.run()
 	return tb
 }
+
+func (t *TokenBucket) run() {
+	defer close(t.stopDone)
+	for range t.ticker.C {
+		select {
+		case t.tokens <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Wait blocks until a token is available or the context is canceled.
 func (t *TokenBucket) Wait(ctx context.Context) error {
 	select {
-	case <-t.ch:
-		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return fmt.Errorf("rate wait canceled: %w", ctx.Err())
+	case <-t.tokens:
+		return nil
 	}
 }
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+
+// Stop releases resources held by the limiter.
+func (t *TokenBucket) Stop() {
+	t.ticker.Stop()
+	<-t.stopDone
 }
+
+var _ Limiter = (*TokenBucket)(nil)

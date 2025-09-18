@@ -1,30 +1,36 @@
-// internal/gmail/types.go
 package gmail
 
 import "time"
 
+// MessageID uniquely identifies a Gmail message.
 type MessageID string
+
+// LabelID identifies a Gmail label.
 type LabelID string
 
-type Header struct {
-	Name  string
-	Value string
+// Query represents a raw Gmail search query string.
+type Query struct {
+	Raw string
 }
 
+// MessageMeta captures metadata for a Gmail message that is safe to fetch quickly.
 type MessageMeta struct {
-	ID      MessageID
-	Labels  []LabelID
-	Headers map[string]string // From, To, Subject, List-Id, Auto-Submitted, Precedence, Date, etc.
-	Date    time.Time
+	ID       MessageID
+	LabelIDs []LabelID
+	Headers  map[string]string
+	Date     time.Time
 }
 
+// ModifyOps describes the label mutations to apply to a set of messages.
 type ModifyOps struct {
 	AddLabels    []LabelID
 	RemoveLabels []LabelID
-	MarkRead     bool // implies removing UNREAD
-	Archive      bool // implies removing INBOX
+	MarkRead     bool
+	Archive      bool
 }
 
-type Query struct {
-	Raw string // Gmail query string, already formed (e.g., `in:inbox is:unread before:1726440000 -is:starred -label:"team"`)
+// ListPage contains a set of message IDs and a pagination token for the next page.
+type ListPage struct {
+	IDs           []MessageID
+	NextPageToken string
 }

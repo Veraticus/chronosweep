@@ -1,71 +1,134 @@
-// internal/runtime/googleapi.go — adapts *gmail.Service to our small interface
 package runtime
 
 import (
 	"context"
 	"fmt"
+	"time"
 
-	"google.golang.org/api/gmail/v1"
+	gmailapi "google.golang.org/api/gmail/v1"
 
-	gc "github.com/yourorg/chronosweep/internal/gmail"
+	"github.com/joshsymonds/chronosweep/internal/gmail"
 )
 
-type googleClient struct{ svc *gmail.Service }
+// ClientAdapter implements gmail.Client using the Google API client.
+type ClientAdapter struct {
+	svc *gmailapi.Service
+}
 
-func NewGoogleAPIClient(svc *gmail.Service) *googleClient { return &googleClient{svc} }
+// NewGoogleAPIClient wraps a gmail Service with the chronosweep gmail.Client interface.
+func NewGoogleAPIClient(svc *gmailapi.Service) *ClientAdapter {
+	return &ClientAdapter{svc: svc}
+}
 
-func (g *googleClient) List(ctx context.Context, q gc.Query, pageSize int) ([]gc.MessageID, string, error) {
-	call := g.svc.Users.Messages.List("me").Q(q.Raw).MaxResults(int64(pageSize))
+// List retrieves message identifiers matching the supplied query.
+func (g *ClientAdapter) List(
+	ctx context.Context,
+	q gmail.Query,
+	pageToken string,
+	pageSize int,
+) (gmail.ListPage, error) {
+	call := g.svc.Users.Messages.List("me").Q(q.Raw)
+	if pageSize > 0 {
+		call = call.MaxResults(int64(pageSize))
+	}
+	if pageToken != "" {
+		call = call.PageToken(pageToken)
+	}
 	res, err := call.Context(ctx).Do()
 	if err != nil {
-		return nil, "", err
+		return gmail.ListPage{}, fmt.Errorf("list messages: %w", err)
 	}
-	var ids []gc.MessageID
-	for _, m := range res.Messages {
-		ids = append(ids, gc.MessageID(m.Id))
+	ids := make([]gmail.MessageID, 0, len(res.Messages))
+	for _, msg := range res.Messages {
+		ids = append(ids, gmail.MessageID(msg.Id))
 	}
-	return ids, res.NextPageToken, nil
+	return gmail.ListPage{IDs: ids, NextPageToken: res.NextPageToken}, nil
 }
 
-func (g *googleClient) GetMetadata(ctx context.Context, id gc.MessageID, headers []string) (gc.MessageMeta, error) {
-	msg, err := g.svc.Users.Messages.Get("me", string(id)).Format("metadata").MetadataHeaders(headers...).Context(ctx).Do()
+// GetMetadata fetches metadata headers for a specific message.
+func (g *ClientAdapter) GetMetadata(
+	ctx context.Context,
+	id gmail.MessageID,
+	headers []string,
+) (gmail.MessageMeta, error) {
+	call := g.svc.Users.Messages.Get("me", string(id)).
+		Format("metadata").
+		MetadataHeaders(headers...)
+	msg, err := call.Context(ctx).Do()
 	if err != nil {
-		return gc.MessageMeta{}, err
+		return gmail.MessageMeta{}, fmt.Errorf("get metadata %s: %w", id, err)
 	}
-	h := map[string]string{}
-	for _, hd := range msg.Payload.Headers {
-		h[hd.Name] = hd.Value
+	headersMap := make(map[string]string, len(msg.Payload.Headers))
+	for _, h := range msg.Payload.Headers {
+		headersMap[h.Name] = h.Value
 	}
-	return gc.MessageMeta{ID: id, Headers: h, Labels: toLabelIDs(msg.LabelIds)}, nil
+	meta := gmail.MessageMeta{
+		ID:       id,
+		LabelIDs: toLabelIDs(msg.LabelIds),
+		Headers:  headersMap,
+		Date:     time.UnixMilli(msg.InternalDate),
+	}
+	return meta, nil
 }
 
-func (g *googleClient) BatchModify(ctx context.Context, ids []gc.MessageID, ops gc.ModifyOps) error {
-	req := &gmail.BatchModifyMessagesRequest{Ids: toStrings(ids)}
-	if len(ops.AddLabels) > 0 {
-		req.AddLabelIds = toStringsL(ops.AddLabels)
+// BatchModify applies label modifications to the provided message IDs.
+func (g *ClientAdapter) BatchModify(
+	ctx context.Context,
+	ids []gmail.MessageID,
+	ops gmail.ModifyOps,
+) error {
+	if len(ids) == 0 {
+		return nil
 	}
-	if len(ops.RemoveLabels) > 0 {
-		req.RemoveLabelIds = toStringsL(ops.RemoveLabels)
+	req := &gmailapi.BatchModifyMessagesRequest{
+		Ids: toStrings(ids),
 	}
-	_, err := g.svc.Users.Messages.BatchModify("me", req).Context(ctx).Do()
-	return err
+	add := make([]string, 0, len(ops.AddLabels))
+	for _, lid := range ops.AddLabels {
+		add = append(add, string(lid))
+	}
+	remove := make([]string, 0, len(ops.RemoveLabels))
+	for _, lid := range ops.RemoveLabels {
+		remove = append(remove, string(lid))
+	}
+	if ops.MarkRead {
+		remove = append(remove, "UNREAD")
+	}
+	if ops.Archive {
+		remove = append(remove, "INBOX")
+	}
+	if len(add) > 0 {
+		req.AddLabelIds = add
+	}
+	if len(remove) > 0 {
+		req.RemoveLabelIds = remove
+	}
+	if err := g.svc.Users.Messages.BatchModify("me", req).Context(ctx).Do(); err != nil {
+		return fmt.Errorf("batch modify: %w", err)
+	}
+	return nil
 }
 
-func (g *googleClient) ListLabels(ctx context.Context) (map[string]gc.LabelID, map[gc.LabelID]string, error) {
-	lr, err := g.svc.Users.Labels.List("me").Context(ctx).Do()
+// ListLabels returns Gmail labels keyed by both name and identifier.
+func (g *ClientAdapter) ListLabels(
+	ctx context.Context,
+) (map[string]gmail.LabelID, map[gmail.LabelID]string, error) {
+	res, err := g.svc.Users.Labels.List("me").Context(ctx).Do()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("list labels: %w", err)
 	}
-	byName := map[string]gc.LabelID{}
-	byID := map[gc.LabelID]string{}
-	for _, l := range lr.Labels {
-		byName[l.Name] = gc.LabelID(l.Id)
-		byID[gc.LabelID(l.Id)] = l.Name
+	byName := make(map[string]gmail.LabelID, len(res.Labels))
+	byID := make(map[gmail.LabelID]string, len(res.Labels))
+	for _, lbl := range res.Labels {
+		id := gmail.LabelID(lbl.Id)
+		byName[lbl.Name] = id
+		byID[id] = lbl.Name
 	}
 	return byName, byID, nil
 }
 
-func (g *googleClient) EnsureLabel(ctx context.Context, name string) (gc.LabelID, error) {
+// EnsureLabel guarantees that the requested label exists, creating it when necessary.
+func (g *ClientAdapter) EnsureLabel(ctx context.Context, name string) (gmail.LabelID, error) {
 	byName, _, err := g.ListLabels(ctx)
 	if err != nil {
 		return "", err
@@ -73,11 +136,27 @@ func (g *googleClient) EnsureLabel(ctx context.Context, name string) (gc.LabelID
 	if id, ok := byName[name]; ok {
 		return id, nil
 	}
-	created, err := g.svc.Users.Labels.Create("me", &gmail.Label{Name: name}).Context(ctx).Do()
+	created, err := g.svc.Users.Labels.Create("me", &gmailapi.Label{Name: name}).Context(ctx).Do()
 	if err != nil {
 		return "", fmt.Errorf("create label %q: %w", name, err)
 	}
-	return gc.LabelID(created.Id), nil
+	return gmail.LabelID(created.Id), nil
 }
 
-// helpers toStrings, toStringsL, toLabelIDs omitted for brevity
+func toStrings(ids []gmail.MessageID) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, string(id))
+	}
+	return out
+}
+
+func toLabelIDs(ids []string) []gmail.LabelID {
+	out := make([]gmail.LabelID, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, gmail.LabelID(id))
+	}
+	return out
+}
+
+var _ gmail.Client = (*ClientAdapter)(nil)

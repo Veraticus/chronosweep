@@ -62,7 +62,7 @@
           buildInputs = [
             pkgs.go
             pkgs.golangci-lint
-            pkgs.staticcheck
+            pkgs.go-tools
           ];
         };
       }
